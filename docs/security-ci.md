@@ -1,7 +1,7 @@
 # Security CI guide
 
 This project runs a set of automated security checks on every pull request and
-on every push to `dev` and `main`. This page explains what each one does, whether it can
+on every push to `main`. This page explains what each one does, whether it can
 block a merge, and the few one-time settings you should turn on to get the full
 benefit.
 
