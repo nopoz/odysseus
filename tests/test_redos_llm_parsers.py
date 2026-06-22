@@ -48,6 +48,14 @@ def test_gemma_channel_unwrap_unchanged():
     assert strip_think(text) == "Final."
 
 
+def test_thought_prefix_tags_not_overmatched():
+    # The `<thought...>` opener must keep a tag-name boundary: tags whose names
+    # merely start with "thought" are unrelated markup and must pass through
+    # untouched (no `<thinkful>`/`<thinks>` corruption).
+    for text in ("<thoughtful>keep</thoughtful>", "<thoughts>keep</thoughts>"):
+        assert normalize_thinking_markup(text) == text
+
+
 def test_tool_call_blocks_still_parsed():
     blocks = parse_tool_blocks('[TOOL_CALL]{tool: "shell", command: "ls"}[/TOOL_CALL]')
     assert blocks, "well-formed [TOOL_CALL] block should still parse"
@@ -102,5 +110,41 @@ def test_tool_code_opener_flood_is_fast():
     evil = "<tool_code>{tool: x}" * 6000  # '}' present but no </tool_code> closer
     _, dt = _timed(parse_tool_blocks, evil)
     assert dt < _BUDGET_S, f"parse_tool_blocks took {dt:.2f}s"
+    _, dt2 = _timed(strip_tool_blocks, evil)
+    assert dt2 < _BUDGET_S, f"strip_tool_blocks took {dt2:.2f}s"
+
+
+# ── a present closer must not re-enable the O(n^2) rescan ────────────────────
+# A whole-string "closer exists?" guard is defeated by a stale closer placed
+# before an opener flood, or by a closer whose required inner delimiter is
+# missing. The parser must pair each opener only with a *later* closer.
+
+def test_xml_stale_closer_before_opener_flood_is_fast():
+    # A lone leading </tool_call> makes a whole-string closer check true, but no
+    # opener after it has a reachable closer. (strip exercises the CodeQL-flagged
+    # _XML_TOOL_CALL_RE path; parse additionally reaches _XML_DIRECT_TOOL_RE, the
+    # separate backreference pattern tracked as a follow-up — see
+    # test_xml_tool_call_opener_flood_is_fast.)
+    evil = "</tool_call>" + ("<tool_call>" + "a" * 10) * 6000
+    _, dt = _timed(strip_tool_blocks, evil)
+    assert dt < _BUDGET_S, f"strip_tool_blocks took {dt:.2f}s"
+
+
+def test_tool_call_closer_present_without_inner_brace_is_fast():
+    # Leading [/TOOL_CALL] satisfies a substring guard, but the openers carry no
+    # inner '}', so '}\\s*[/TOOL_CALL]' is never reachable from any opener.
+    evil = "[/TOOL_CALL]" + "[TOOL_CALL]{tool: x" * 6000
+    blocks, dt = _timed(parse_tool_blocks, evil)
+    assert dt < _BUDGET_S, f"parse_tool_blocks took {dt:.2f}s"
+    assert blocks == []
+    _, dt2 = _timed(strip_tool_blocks, evil)
+    assert dt2 < _BUDGET_S, f"strip_tool_blocks took {dt2:.2f}s"
+
+
+def test_tool_code_closer_present_without_inner_brace_is_fast():
+    evil = "</tool_code>" + "<tool_code>{tool: x" * 6000
+    blocks, dt = _timed(parse_tool_blocks, evil)
+    assert dt < _BUDGET_S, f"parse_tool_blocks took {dt:.2f}s"
+    assert blocks == []
     _, dt2 = _timed(strip_tool_blocks, evil)
     assert dt2 < _BUDGET_S, f"strip_tool_blocks took {dt2:.2f}s"

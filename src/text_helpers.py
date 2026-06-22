@@ -36,11 +36,13 @@ _GEMMA_RESPONSE_CHANNEL_RE = re.compile(
 )
 _GEMMA_RESPONSE_OPEN_RE = re.compile(r"<\|channel>response\s*\n?", re.IGNORECASE)
 _GEMMA_CHANNEL_CLOSE_RE = re.compile(r"<channel\|>", re.IGNORECASE)
-# `([^>]*)` not `(\s+[^>]*)?`: the latter lets `\s+` and `[^>]*` both match the
-# same whitespace, so an opener with no `>` (e.g. `<thought ` + junk) backtracks
-# quadratically on untrusted model output. `([^>]*)` captures the identical
-# attribute text without the ambiguity.
-_THOUGHT_TAG_OPEN_RE = re.compile(r"<thought([^>]*)>", re.IGNORECASE)
+# `(\s[^>]*)?` not `(\s+[^>]*)?`: the original `\s+` overlapped `[^>]*` (both
+# match whitespace), so an opener with no `>` (e.g. `<thought ` + junk)
+# backtracks quadratically on untrusted model output. A single fixed `\s`
+# removes that ambiguity (linear) while still requiring a tag-name boundary
+# after `thought`, so `<thoughtful>`/`<thoughts>` are left alone. The capture is
+# byte-for-byte identical to the original for real `<thought ...>` openers.
+_THOUGHT_TAG_OPEN_RE = re.compile(r"<thought(\s[^>]*)?>", re.IGNORECASE)
 _THOUGHT_TAG_CLOSE_RE = re.compile(r"</thought>", re.IGNORECASE)
 _GEMMA_THOUGHT_CHANNEL_CAPTURE_RE = re.compile(
     r"<\|channel>thought\s*\n?([\s\S]*?)<channel\|>\s*",
