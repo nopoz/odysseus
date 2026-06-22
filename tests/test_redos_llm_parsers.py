@@ -88,6 +88,14 @@ def test_gemma_channel_opener_flood_is_fast():
     assert dt < _BUDGET_S, f"normalize_thinking_markup took {dt:.2f}s"
 
 
+def test_gemma_stale_closer_before_opener_flood_is_fast():
+    # A lone leading <channel|> makes a whole-string "closer present?" check
+    # true, but no <|channel>thought opener after it has a reachable closer.
+    evil = "<channel|>" + "<|channel>thought\n" * 4000
+    _, dt = _timed(normalize_thinking_markup, evil)
+    assert dt < _BUDGET_S, f"normalize_thinking_markup took {dt:.2f}s"
+
+
 def test_tool_call_opener_flood_is_fast():
     evil = "[TOOL_CALL]{tool: x}" * 6000  # '}' present but no [/TOOL_CALL] closer
     blocks, dt = _timed(parse_tool_blocks, evil)
