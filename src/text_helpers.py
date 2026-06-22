@@ -36,7 +36,11 @@ _GEMMA_RESPONSE_CHANNEL_RE = re.compile(
 )
 _GEMMA_RESPONSE_OPEN_RE = re.compile(r"<\|channel>response\s*\n?", re.IGNORECASE)
 _GEMMA_CHANNEL_CLOSE_RE = re.compile(r"<channel\|>", re.IGNORECASE)
-_THOUGHT_TAG_OPEN_RE = re.compile(r"<thought(\s+[^>]*)?>", re.IGNORECASE)
+# `([^>]*)` not `(\s+[^>]*)?`: the latter lets `\s+` and `[^>]*` both match the
+# same whitespace, so an opener with no `>` (e.g. `<thought ` + junk) backtracks
+# quadratically on untrusted model output. `([^>]*)` captures the identical
+# attribute text without the ambiguity.
+_THOUGHT_TAG_OPEN_RE = re.compile(r"<thought([^>]*)>", re.IGNORECASE)
 _THOUGHT_TAG_CLOSE_RE = re.compile(r"</thought>", re.IGNORECASE)
 _GEMMA_THOUGHT_CHANNEL_CAPTURE_RE = re.compile(
     r"<\|channel>thought\s*\n?([\s\S]*?)<channel\|>\s*",
@@ -110,8 +114,12 @@ def normalize_thinking_markup(text: str) -> str:
         thought = match.group(1).strip()
         return f"<think>{thought}</think>\n" if thought else ""
 
-    out = _GEMMA_THOUGHT_CHANNEL_CAPTURE_RE.sub(_replace_gemma_thought, out)
-    out = _GEMMA_RESPONSE_CHANNEL_RE.sub(lambda m: m.group(1), out)
+    # Both capture patterns require a `<channel|>` closer; without one they
+    # match nothing, but the lazy `[\s\S]*?` still rescans to end-of-string from
+    # every opener (O(n^2) on untrusted model output). Skip when no closer.
+    if "<channel|>" in out.lower():
+        out = _GEMMA_THOUGHT_CHANNEL_CAPTURE_RE.sub(_replace_gemma_thought, out)
+        out = _GEMMA_RESPONSE_CHANNEL_RE.sub(lambda m: m.group(1), out)
     out = _GEMMA_RESPONSE_OPEN_RE.sub("", out)
     out = _GEMMA_CHANNEL_CLOSE_RE.sub("", out)
     return out

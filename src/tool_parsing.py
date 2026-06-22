@@ -43,6 +43,13 @@ _XML_OPEN_TOOL_CALL_RE = re.compile(
     r"<(?:[\w]+:)?(?:tool_call|function_call)>\s*([\s\S]*)\Z",
     re.IGNORECASE,
 )
+# Cheap linear-time detector for a closing tool-call tag. Used to gate the
+# O(n^2)-prone _XML_TOOL_CALL_RE: without a closer it cannot match, so we skip
+# its rescan-from-every-opener on untrusted model output.
+_XML_TOOL_CALL_CLOSE_RE = re.compile(
+    r"</(?:[\w]+:)?(?:tool_call|function_call)>",
+    re.IGNORECASE,
+)
 _XML_INVOKE_RE = re.compile(
     r'<invoke\s+name=["\'](\w+)["\']>\s*([\s\S]*?)</invoke>',
     re.IGNORECASE,
@@ -711,8 +718,12 @@ def parse_tool_blocks(text: str, skip_fenced: bool = False) -> List[ToolBlock]:
             blocks.append(ToolBlock(tag, content))
 
     # Pattern 2: [TOOL_CALL] blocks (only if no fenced blocks found)
+    # The closer guards below skip the delimiter-bounded regexes when their
+    # closing tag is absent: they would match nothing anyway, but the lazy
+    # `[\s\S]*?` otherwise rescans to end-of-string from every opener, which is
+    # O(n^2) on untrusted model output (ReDoS).
     if not blocks:
-        for m in _TOOL_CALL_RE.finditer(text):
+        for m in (_TOOL_CALL_RE.finditer(text) if "[/tool_call]" in text.lower() else ()):
             block = _parse_tool_call_block(m.group(1))
             if block:
                 blocks.append(block)
@@ -726,7 +737,7 @@ def parse_tool_blocks(text: str, skip_fenced: bool = False) -> List[ToolBlock]:
         if blocks:
             return blocks
         # Try wrapped: <tool_call><invoke ...>...</invoke></tool_call>
-        for m in _XML_TOOL_CALL_RE.finditer(text):
+        for m in (_XML_TOOL_CALL_RE.finditer(text) if _XML_TOOL_CALL_CLOSE_RE.search(text) else ()):
             for inv in _XML_INVOKE_RE.finditer(m.group(1)):
                 block = _parse_xml_invoke(inv)
                 if block:
@@ -760,7 +771,7 @@ def parse_tool_blocks(text: str, skip_fenced: bool = False) -> List[ToolBlock]:
 
     # Pattern 4: <tool_code> blocks (MiniMax-M2.5 style)
     if not blocks:
-        for m in _TOOL_CODE_RE.finditer(text):
+        for m in (_TOOL_CODE_RE.finditer(text) if "</tool_code>" in text.lower() else ()):
             block = _parse_tool_code_block(m.group(1))
             if block:
                 blocks.append(block)
@@ -791,11 +802,17 @@ def strip_tool_blocks(text: str, skip_fenced: bool = False) -> str:
     # / <tool_call> removers below instead of leaking to the user.
     text = _normalize_dsml(text)
     cleaned = text if skip_fenced else _TOOL_BLOCK_RE.sub('', text)
-    cleaned = _TOOL_CALL_RE.sub('', cleaned)
+    # Closer guards mirror parse_tool_blocks: skip the delimiter-bounded
+    # regexes when their closing tag is absent (no match possible) to avoid the
+    # O(n^2) lazy-rescan on untrusted model output.
+    if "[/tool_call]" in cleaned.lower():
+        cleaned = _TOOL_CALL_RE.sub('', cleaned)
     cleaned = _strip_stepfun_tool_markup(cleaned)
-    cleaned = _XML_TOOL_CALL_RE.sub('', cleaned)
+    if _XML_TOOL_CALL_CLOSE_RE.search(cleaned):
+        cleaned = _XML_TOOL_CALL_RE.sub('', cleaned)
     cleaned = _XML_OPEN_TOOL_CALL_RE.sub('', cleaned)
-    cleaned = _TOOL_CODE_RE.sub('', cleaned)
+    if "</tool_code>" in cleaned.lower():
+        cleaned = _TOOL_CODE_RE.sub('', cleaned)
     if not skip_fenced:
         raw_web_json = _parse_raw_web_json_lookup(cleaned)
         if raw_web_json:
