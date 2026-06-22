@@ -413,8 +413,8 @@ function _calEventFg(ev) {
 // Returns '' for normal solid-color events.
 function _calItemBgStyle(ev) {
   if (!_isCalBgImage(ev.color)) return '';
-  const url = _cssUrlEscape(_calBgImageUrl(ev.color));
-  return `background-image: linear-gradient(color-mix(in srgb, var(--bg) 70%, transparent), color-mix(in srgb, var(--bg) 70%, transparent)), url('${url}'); background-size: cover; background-position: center;`;
+  const url = _calBgImageUrl(ev.color);
+  return `background-image: linear-gradient(color-mix(in srgb, var(--bg) 70%, transparent), color-mix(in srgb, var(--bg) 70%, transparent)), url('${_cssUrlEscape(url)}'); background-size: cover; background-position: center;`;
 }
 
 function _todayCount() {
@@ -1260,8 +1260,8 @@ async function _renderWeek() {
       // events keep the original tinted treatment.
       let bgDecl;
       if (_isCalBgImage(ev.color)) {
-        const _url = _cssUrlEscape(_calBgImageUrl(ev.color));
-        bgDecl = `background-image: linear-gradient(color-mix(in srgb, var(--bg) 55%, transparent), color-mix(in srgb, var(--bg) 55%, transparent)), url('${_url}'); background-size: cover; background-position: center;`;
+        const _url = _calBgImageUrl(ev.color);
+        bgDecl = `background-image: linear-gradient(color-mix(in srgb, var(--bg) 55%, transparent), color-mix(in srgb, var(--bg) 55%, transparent)), url('${_cssUrlEscape(_url)}'); background-size: cover; background-position: center;`;
       } else {
         bgDecl = `background:color-mix(in srgb, ${_calColor(ev)} 18%, var(--bg));`;
       }
@@ -2853,7 +2853,7 @@ function _showEventForm(existing, defaultDate, defaultEndDate) {
             let bg;
             if (isCustom) {
               const url = _calBgImageUrl(cur);
-              bg = url ? `center/cover no-repeat url('${url}')` : _CAL_CUSTOM_GRADIENT;
+              bg = url ? `center/cover no-repeat url('${_cssUrlEscape(url)}')` : _CAL_CUSTOM_GRADIENT;
             } else {
               bg = c.hex || 'var(--border)';
             }
@@ -2950,7 +2950,7 @@ function _showEventForm(existing, defaultDate, defaultEndDate) {
         if (!url) return;
         const sentinel = 'bg:' + url;
         dot.dataset.color = sentinel;
-        dot.style.background = `center/cover no-repeat url('${url}')`;
+        dot.style.background = `center/cover no-repeat url('${_cssUrlEscape(url)}')`;
         document.querySelectorAll('#cal-f-colors .note-color-dot').forEach(d => d.classList.remove('active'));
         dot.classList.add('active');
         _applyFormTint(sentinel);

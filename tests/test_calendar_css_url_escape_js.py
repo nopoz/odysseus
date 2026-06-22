@@ -13,6 +13,7 @@ quotes, so no input can terminate the `url('...')` string early.
 """
 
 import json
+import re
 import shutil
 import subprocess
 import textwrap
@@ -22,6 +23,7 @@ import pytest
 
 _REPO = Path(__file__).resolve().parent.parent
 _UTILS = (_REPO / "static" / "js" / "calendar" / "utils.js").as_posix()
+_CALENDAR_JS = _REPO / "static" / "js" / "calendar.js"
 _HAS_NODE = shutil.which("node") is not None
 
 pytestmark = pytest.mark.skipif(not _HAS_NODE, reason="node binary not on PATH")
@@ -87,3 +89,19 @@ def test_calbgcss_escapes_quote_breakout():
     # the injected single quote is escaped, so the url() string is not closed early
     assert r"\'" in css
     assert "url('a\\'); X{}//')" in css
+
+
+def test_every_calendar_url_interpolation_is_escaped():
+    # Whole-file invariant: every CSS `url('${...}')` built in calendar.js must
+    # route its (CalDAV-syncable, untrusted) value through `_cssUrlEscape`. This
+    # is the guard that catches a *newly added* bg-image sink the centralization
+    # forgot - the failure mode that left calendar.js:2856 (edit-form color
+    # swatch) and :2953 (custom-dot preview) raw before this change.
+    src = _CALENDAR_JS.read_text(encoding="utf-8")
+    interps = re.findall(r"url\('\$\{([^}]*)\}'\)", src)
+    assert interps, "expected at least one url('${...}') interpolation in calendar.js"
+    unescaped = [expr for expr in interps if "_cssUrlEscape(" not in expr]
+    assert not unescaped, (
+        "bg-image url() interpolation(s) not routed through _cssUrlEscape: "
+        + ", ".join(repr(e) for e in unescaped)
+    )
