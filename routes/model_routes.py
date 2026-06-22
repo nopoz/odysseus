@@ -17,6 +17,7 @@ from fastapi import APIRouter, HTTPException, Form, Query, Body, Request, Respon
 from pydantic import BaseModel
 from fastapi.responses import StreamingResponse
 from core.database import SessionLocal, ModelEndpoint, Session as DbSession
+from core.log_safety import redact_url as _redact_url_for_log
 from core.middleware import require_admin
 from src.llm_core import _detect_provider, _host_match, ANTHROPIC_MODELS
 from src.tls_overrides import llm_verify
@@ -580,18 +581,6 @@ def _safe_build_headers(api_key: Optional[str], base_url: str) -> dict:
     except Exception as exc:
         logger.debug("Header detection failed for %s: %s", base_url, exc)
         return {"Authorization": f"Bearer {api_key}"} if api_key else {}
-
-
-def _redact_url_for_log(url: str) -> str:
-    """Return a URL safe for logs by removing userinfo and query/fragment."""
-    try:
-        parsed = urlparse(url or "")
-        host = parsed.hostname or ""
-        if parsed.port:
-            host = f"{host}:{parsed.port}"
-        return urlunparse((parsed.scheme, host, parsed.path, "", "", ""))
-    except Exception:
-        return "<endpoint>"
 
 
 def _is_discovery_only_provider(provider: str) -> bool:

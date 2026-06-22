@@ -13,6 +13,11 @@ def test_keeps_port_and_path():
     assert redact_url("http://host.example:8080/api/tags") == "http://host.example:8080/api/tags"
 
 
+def test_ipv6_host_keeps_brackets():
+    assert redact_url("https://user:pass@[2001:db8::1]:8443/v1") == "https://[2001:db8::1]:8443/v1"
+    assert redact_url("https://[2001:db8::1]/v1") == "https://[2001:db8::1]/v1"
+
+
 def test_no_credentials_passthrough():
     assert redact_url("https://host.example/v1/models") == "https://host.example/v1/models"
 

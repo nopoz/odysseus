@@ -18,6 +18,8 @@ def redact_url(url: str) -> str:
     try:
         parsed = urlparse(url or "")
         host = parsed.hostname or ""
+        if ":" in host:  # IPv6 literal — re-bracket so host:port stays unambiguous
+            host = f"[{host}]"
         if parsed.port:
             host = f"{host}:{parsed.port}"
         return urlunparse((parsed.scheme, host, parsed.path, "", "", ""))
