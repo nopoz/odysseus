@@ -17,49 +17,25 @@ import re
 
 _THINK_TAG_NAME = r"(?:think(?:ing)?|thought)"
 
-# Closed reasoning blocks, split into opener/closer for forward-only stripping
-# (`_sub_delimited` in `strip_think`). The old combined
-# `<open>[\s\S]*?</close>` lazily rescanned to end-of-string from every opener
-# under `re.sub` -> O(n^2) on attacker-controlled "many openers, no closer"
-# model output (CodeQL py/polynomial-redos). The closer consumes the trailing
-# `\s*`, matching the original.
-#
-# `[^<>]` (not `[^>]`) throughout the opener/tag scans below bounds each
-# attribute run at the next `<`, so an opener flood with no `>` can't drive a
-# single match attempt to end-of-string (the residual O(n^2): `re.sub`/`search`
-# retries `[^>]*` from every opener). A literal `<` never appears inside a
-# well-formed think tag, so the captured attribute text is identical for real
-# `<think ...>` / `</think ...>` openers.
+# Think-tag matchers. `[^<>]` (not `[^>]`) bounds attribute scans at the next
+# `<` so an opener flood with no closing `>` can't backtrack to end-of-string
+# (ReDoS, CodeQL py/polynomial-redos); capture is identical for well-formed tags.
+# Opener/closer are split for the forward-only block strip (_sub_delimited).
 _THINK_OPEN_TAG_RE = re.compile(rf"<{_THINK_TAG_NAME}(?:\s[^<>]*)?>", re.IGNORECASE)
 _THINK_CLOSE_TAG_RE = re.compile(rf"</{_THINK_TAG_NAME}>\s*", re.IGNORECASE)
-# Orphan opening or closing tags that survive after the closed-pass.
+# Orphan opening/closing tags left after the block strip.
 _THINK_TAG_RE = re.compile(rf"</?{_THINK_TAG_NAME}[^<>]*>\s*", re.IGNORECASE)
-# Dangling opener anywhere in the response with no closer — strip everything
-# from `<think>` to the end of string.
+# Dangling opener with no closer: strip from `<think>` to end of string.
 _THINK_OPEN_RE = re.compile(rf"<{_THINK_TAG_NAME}(?:\s[^<>]*)?>[\s\S]*$", re.IGNORECASE)
-# Streaming models occasionally emit `<thinking time="0.42">`-style attributes.
-# Normalize to a plain `<think>` so the regexes above catch them.
+# Normalize `<thinking time="0.42">`-style attributes to a plain `<think>`.
 _THINK_ATTR_RE = re.compile(rf"<{_THINK_TAG_NAME}\s[^<>]*>", re.IGNORECASE)
 _THINK_ATTR_CLOSE_RE = re.compile(rf"</{_THINK_TAG_NAME}\s[^<>]*>", re.IGNORECASE)
 _GEMMA_THOUGHT_OPEN_RE = re.compile(r"<\|channel>thought\s*\n?[\s\S]*$", re.IGNORECASE)
 _GEMMA_RESPONSE_OPEN_RE = re.compile(r"<\|channel>response\s*\n?", re.IGNORECASE)
 _GEMMA_CHANNEL_CLOSE_RE = re.compile(r"<channel\|>", re.IGNORECASE)
-# `(\s[^<>]*)?` not `(\s+[^>]*)?`: the original `\s+` overlapped `[^>]*` (both
-# match whitespace), so a single opener with no `>` (e.g. `<thought ` + junk)
-# backtracks quadratically. A fixed `\s` removes that ambiguity and keeps the
-# tag-name boundary (so `<thoughtful>`/`<thoughts>` are left alone), but `\s`
-# alone is not enough: an opener *flood* (`<thought x` repeated, no `>`) still
-# rescanned `[^>]*` to end-of-string from every opener under `re.sub` (O(n^2)).
-# Bounding the run at `<` (`[^<>]`) stops each attempt at the next opener, so
-# the flood is linear; the capture is identical for real `<thought ...>` openers.
 _THOUGHT_TAG_OPEN_RE = re.compile(r"<thought(\s[^<>]*)?>", re.IGNORECASE)
 _THOUGHT_TAG_CLOSE_RE = re.compile(r"</thought>", re.IGNORECASE)
-# Gemma thought-channel delimiters, split for forward-only substitution
-# (_sub_delimited): the lazy `[\s\S]*?` between an opener and `<channel|>`
-# otherwise rescans to end-of-string from every opener when no closer is
-# reachable (O(n^2) on untrusted model output). The closer consumes the
-# trailing `\s*`, matching the original `<channel|>\s*`. The response channel
-# reuses _GEMMA_RESPONSE_OPEN_RE / _GEMMA_CHANNEL_CLOSE_RE as opener/closer.
+# Gemma thought-channel delimiters, split for the forward-only sub (_sub_delimited).
 _GEMMA_THOUGHT_CHANNEL_OPEN_RE = re.compile(r"<\|channel>thought\s*\n?", re.IGNORECASE)
 _GEMMA_CHANNEL_CLOSE_TRIM_RE = re.compile(r"<channel\|>\s*", re.IGNORECASE)
 # Qwen and a few other models prefix the response with a "Thinking Process:"
@@ -114,17 +90,12 @@ def _strip_reasoning_prose(text: str) -> str:
 
 
 def _sub_delimited(text, open_re, close_re, repl):
-    """Forward-only equivalent of ``open_re([\\s\\S]*?)close_re`` ``re.sub(repl)``.
+    """Forward-only ``re.sub`` of ``open_re...close_re`` that can't ReDoS.
 
-    Pairs each opener with the first closer after it, then resumes past that
-    closer, and stops as soon as an opener has no reachable closer (no later
-    opener can have one either). That keeps it O(n) where ``re.sub`` retries
-    from every opener and rescans to end-of-string each time -> O(n^2) on
-    attacker-controlled "many openers, no closer" model output (CodeQL
-    py/polynomial-redos). ``repl`` receives the inner text (the lazy capture
-    group) and returns its replacement.
-
-    A whole-string "is a closer present?" guard is not enough: a stale closer
+    Pairs each opener with the first closer after it and stops once no closer is
+    reachable, so it stays O(n) instead of re.sub's rescan-to-end from every
+    opener (O(n^2) on "many openers, no closer" input). ``repl`` gets the inner
+    text. A whole-string "closer present?" guard is not enough: a stale closer
     before an opener flood keeps it true while every opener still rescans.
     """
     out = []
@@ -160,8 +131,7 @@ def normalize_thinking_markup(text: str) -> str:
         thought = inner.strip()
         return f"<think>{thought}</think>\n" if thought else ""
 
-    # Forward-only substitution so an unreachable/stale `<channel|>` can't drive
-    # the O(n^2) lazy-rescan on untrusted model output (ReDoS); see _sub_delimited.
+    # Forward-only so a stale/unreachable `<channel|>` can't drive a ReDoS rescan.
     out = _sub_delimited(
         out, _GEMMA_THOUGHT_CHANNEL_OPEN_RE, _GEMMA_CHANNEL_CLOSE_TRIM_RE, _replace_gemma_thought
     )
@@ -205,12 +175,8 @@ def strip_think(text: str, *, prose: bool = False, prompt_echo: bool = True) -> 
     # Normalize attributes so the closed/open regexes can catch them.
     text = _THINK_ATTR_RE.sub("<think>", text)
     text = _THINK_ATTR_CLOSE_RE.sub("</think>", text)
-    # Forward-only block strip: pair each opener with the first closer after it
-    # and stop once none is reachable, instead of the old lazy
-    # `<open>[\s\S]*?</close>` re.sub loop that rescanned to end-of-string from
-    # every opener (O(n^2) on untrusted "many openers, no closer" output). One
-    # forward pass already collapses sequential and nested blocks the way the
-    # multi-pass loop did, so the loop is no longer needed.
+    # Forward-only block strip (see _sub_delimited): one pass collapses nested
+    # and sequential blocks without the old lazy re.sub loop's ReDoS rescan.
     out = _sub_delimited(text, _THINK_OPEN_TAG_RE, _THINK_CLOSE_TAG_RE, lambda _inner: "")
     out = _THINK_OPEN_RE.sub("", out)
     out = _THINK_TAG_RE.sub("", out)
