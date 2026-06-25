@@ -17,28 +17,42 @@ import re
 
 _THINK_TAG_NAME = r"(?:think(?:ing)?|thought)"
 
-# Closed reasoning blocks. Multi-pass loop in `strip_think` handles nested
-# `<think><think>...</think></think>` patterns some models emit.
-_THINK_CLOSED_RE = re.compile(rf"<{_THINK_TAG_NAME}(?:\s+[^>]*)?>[\s\S]*?</{_THINK_TAG_NAME}>\s*", re.IGNORECASE)
+# Closed reasoning blocks, split into opener/closer for forward-only stripping
+# (`_sub_delimited` in `strip_think`). The old combined
+# `<open>[\s\S]*?</close>` lazily rescanned to end-of-string from every opener
+# under `re.sub` -> O(n^2) on attacker-controlled "many openers, no closer"
+# model output (CodeQL py/polynomial-redos). The closer consumes the trailing
+# `\s*`, matching the original.
+#
+# `[^<>]` (not `[^>]`) throughout the opener/tag scans below bounds each
+# attribute run at the next `<`, so an opener flood with no `>` can't drive a
+# single match attempt to end-of-string (the residual O(n^2): `re.sub`/`search`
+# retries `[^>]*` from every opener). A literal `<` never appears inside a
+# well-formed think tag, so the captured attribute text is identical for real
+# `<think ...>` / `</think ...>` openers.
+_THINK_OPEN_TAG_RE = re.compile(rf"<{_THINK_TAG_NAME}(?:\s[^<>]*)?>", re.IGNORECASE)
+_THINK_CLOSE_TAG_RE = re.compile(rf"</{_THINK_TAG_NAME}>\s*", re.IGNORECASE)
 # Orphan opening or closing tags that survive after the closed-pass.
-_THINK_TAG_RE = re.compile(rf"</?{_THINK_TAG_NAME}[^>]*>\s*", re.IGNORECASE)
+_THINK_TAG_RE = re.compile(rf"</?{_THINK_TAG_NAME}[^<>]*>\s*", re.IGNORECASE)
 # Dangling opener anywhere in the response with no closer — strip everything
 # from `<think>` to the end of string.
-_THINK_OPEN_RE = re.compile(rf"<{_THINK_TAG_NAME}(?:\s+[^>]*)?>[\s\S]*$", re.IGNORECASE)
+_THINK_OPEN_RE = re.compile(rf"<{_THINK_TAG_NAME}(?:\s[^<>]*)?>[\s\S]*$", re.IGNORECASE)
 # Streaming models occasionally emit `<thinking time="0.42">`-style attributes.
 # Normalize to a plain `<think>` so the regexes above catch them.
-_THINK_ATTR_RE = re.compile(rf"<{_THINK_TAG_NAME}\s+[^>]*>", re.IGNORECASE)
-_THINK_ATTR_CLOSE_RE = re.compile(rf"</{_THINK_TAG_NAME}\s+[^>]*>", re.IGNORECASE)
+_THINK_ATTR_RE = re.compile(rf"<{_THINK_TAG_NAME}\s[^<>]*>", re.IGNORECASE)
+_THINK_ATTR_CLOSE_RE = re.compile(rf"</{_THINK_TAG_NAME}\s[^<>]*>", re.IGNORECASE)
 _GEMMA_THOUGHT_OPEN_RE = re.compile(r"<\|channel>thought\s*\n?[\s\S]*$", re.IGNORECASE)
 _GEMMA_RESPONSE_OPEN_RE = re.compile(r"<\|channel>response\s*\n?", re.IGNORECASE)
 _GEMMA_CHANNEL_CLOSE_RE = re.compile(r"<channel\|>", re.IGNORECASE)
-# `(\s[^>]*)?` not `(\s+[^>]*)?`: the original `\s+` overlapped `[^>]*` (both
-# match whitespace), so an opener with no `>` (e.g. `<thought ` + junk)
-# backtracks quadratically on untrusted model output. A single fixed `\s`
-# removes that ambiguity (linear) while still requiring a tag-name boundary
-# after `thought`, so `<thoughtful>`/`<thoughts>` are left alone. The capture is
-# byte-for-byte identical to the original for real `<thought ...>` openers.
-_THOUGHT_TAG_OPEN_RE = re.compile(r"<thought(\s[^>]*)?>", re.IGNORECASE)
+# `(\s[^<>]*)?` not `(\s+[^>]*)?`: the original `\s+` overlapped `[^>]*` (both
+# match whitespace), so a single opener with no `>` (e.g. `<thought ` + junk)
+# backtracks quadratically. A fixed `\s` removes that ambiguity and keeps the
+# tag-name boundary (so `<thoughtful>`/`<thoughts>` are left alone), but `\s`
+# alone is not enough: an opener *flood* (`<thought x` repeated, no `>`) still
+# rescanned `[^>]*` to end-of-string from every opener under `re.sub` (O(n^2)).
+# Bounding the run at `<` (`[^<>]`) stops each attempt at the next opener, so
+# the flood is linear; the capture is identical for real `<thought ...>` openers.
+_THOUGHT_TAG_OPEN_RE = re.compile(r"<thought(\s[^<>]*)?>", re.IGNORECASE)
 _THOUGHT_TAG_CLOSE_RE = re.compile(r"</thought>", re.IGNORECASE)
 # Gemma thought-channel delimiters, split for forward-only substitution
 # (_sub_delimited): the lazy `[\s\S]*?` between an opener and `<channel|>`
@@ -191,12 +205,13 @@ def strip_think(text: str, *, prose: bool = False, prompt_echo: bool = True) -> 
     # Normalize attributes so the closed/open regexes can catch them.
     text = _THINK_ATTR_RE.sub("<think>", text)
     text = _THINK_ATTR_CLOSE_RE.sub("</think>", text)
-    # Multi-pass for nested blocks.
-    prev = None
-    out = text
-    while prev != out:
-        prev = out
-        out = _THINK_CLOSED_RE.sub("", out)
+    # Forward-only block strip: pair each opener with the first closer after it
+    # and stop once none is reachable, instead of the old lazy
+    # `<open>[\s\S]*?</close>` re.sub loop that rescanned to end-of-string from
+    # every opener (O(n^2) on untrusted "many openers, no closer" output). One
+    # forward pass already collapses sequential and nested blocks the way the
+    # multi-pass loop did, so the loop is no longer needed.
+    out = _sub_delimited(text, _THINK_OPEN_TAG_RE, _THINK_CLOSE_TAG_RE, lambda _inner: "")
     out = _THINK_OPEN_RE.sub("", out)
     out = _THINK_TAG_RE.sub("", out)
     if prompt_echo:

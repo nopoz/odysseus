@@ -225,8 +225,13 @@ def _strip_think(text: str) -> str:
     """
     if not text:
         return ""
-    from src.text_helpers import strip_think as _central, _THINK_CLOSED_RE, _THINK_OPEN_RE, _THINK_TAG_RE
-    had_think = bool(_THINK_CLOSED_RE.search(text) or _THINK_OPEN_RE.search(text) or _THINK_TAG_RE.search(text))
+    from src.text_helpers import strip_think as _central, _THINK_TAG_RE
+    # `_THINK_TAG_RE` matches any complete `<think...>`/`</think...>` tag, which
+    # is the union of the old closed/open/tag checks (both required a complete
+    # tag). Using it alone keeps the same had_think result while dropping the
+    # closed/open `.search()` calls, whose lazy `[\s\S]*?`/`(?:\s+[^>]*)?`
+    # rescanned to end-of-string from every opener on untrusted output (O(n^2)).
+    had_think = bool(_THINK_TAG_RE.search(text))
     return _central(text, prose=had_think, prompt_echo=True)
 
 

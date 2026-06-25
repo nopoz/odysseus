@@ -156,3 +156,64 @@ def test_tool_code_closer_present_without_inner_brace_is_fast():
     assert blocks == []
     _, dt2 = _timed(strip_tool_blocks, evil)
     assert dt2 < _BUDGET_S, f"strip_tool_blocks took {dt2:.2f}s"
+
+
+# ── strip_think() is the production entrypoint, not normalize_*  ─────────────
+# The added timing tests above pin normalize_thinking_markup and the delimiter
+# scanners, but every caller (chat titles, email reply/style, deep research,
+# calendar/notes/task cleanup) runs strip_think(), which additionally applies
+# _THINK_ATTR_RE / _THINK_OPEN_RE / _THINK_CLOSED_RE to the same untrusted
+# output. Those carried the identical `\s+[^>]*` overlap and lazy-rescan shapes.
+
+def test_strip_think_nested_and_attr_blocks_unchanged():
+    # Output equivalence for the real-world shapes strip_think must keep handling
+    # (values pin the pre-existing behavior, incl. the nested-block quirk that
+    # leaves the inter-tag `c`, so the forward-only rewrite stays byte-equal).
+    assert strip_think("<think>a<think>b</think>c</think>Answer.") == "cAnswer."
+    assert strip_think('<think time="0.4">reasoning</think>Answer.') == "Answer."
+    assert strip_think("<thinking>x</thinking>Answer.") == "Answer."
+    assert strip_think("<think>r</think>Answer.") == "Answer."
+    assert strip_think("Answer.") == "Answer."
+
+
+def test_strip_think_malformed_open_no_gt_is_fast():
+    # `<think` with no closing '>' — the `(?:\s+[^>]*)?>` opener backtracks
+    # quadratically on the attribute run.
+    for opener in ("<think", "<thinking", "<thought"):
+        evil = opener + " " * 40_000
+        out, dt = _timed(strip_think, evil)
+        assert dt < _BUDGET_S, f"strip_think({opener!r}) took {dt:.2f}s"
+        # No reachable `>`, so nothing is a real tag: content survives the strip.
+        assert out == evil.strip()
+
+
+def test_strip_think_attr_opener_flood_is_fast():
+    # Attribute openers with no `>` and no closer, for each tag name. The opener
+    # `(?:\s[^<>]*)?>` otherwise rescanned to end-of-string from every opener
+    # under re.sub (incl. the `<thought>` normalization pass). `[^<>]` bounds
+    # each attempt at the next opener.
+    for opener in ("<think x", "<thinking x", "<thought x"):
+        evil = opener * 8000
+        _, dt = _timed(strip_think, evil)
+        assert dt < _BUDGET_S, f"strip_think({opener!r}) took {dt:.2f}s"
+
+
+def test_strip_think_closed_opener_flood_is_fast():
+    # Well-formed openers with `>` but no closer: the lazy `[\s\S]*?</think>`
+    # block regex rescanned to end-of-string from every opener under re.sub
+    # -> O(n^2). Replaced by a forward-only pair-and-stop scan.
+    evil = "<think>" * 16000
+    out, dt = _timed(strip_think, evil)
+    assert dt < _BUDGET_S, f"strip_think took {dt:.2f}s"
+    # A run of bare openers with no closer is all reasoning markup -> stripped.
+    assert out == ""
+
+
+def test_strip_think_malformed_closer_flood_is_fast():
+    # Closer flood with no `>` (`</think x` repeated): the stray-tag scan
+    # `</?think[^>]*>` rescanned to end-of-string from every closer. Bounding it
+    # at `<` keeps it linear. Content (no real tags) is preserved.
+    evil = "</think x" * 8000
+    out, dt = _timed(strip_think, evil)
+    assert dt < _BUDGET_S, f"strip_think took {dt:.2f}s"
+    assert out == evil.strip()
