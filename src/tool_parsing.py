@@ -6,6 +6,7 @@ Supports fenced code blocks, [TOOL_CALL] blocks, and XML-style <invoke> blocks.
 """
 
 import ast
+import bisect
 import json
 import logging
 import re
@@ -76,12 +77,21 @@ _XML_DIRECT_TOOL_RE = re.compile(
 _XML_INVOKE_OPEN_RE = re.compile(r'<invoke\s+name=["\'](\w+)["\']>\s*', re.IGNORECASE)
 _XML_INVOKE_CLOSE_RE = re.compile(r'</invoke>', re.IGNORECASE)
 _XML_DIRECT_OPEN_RE = re.compile(r"<\s*([A-Za-z_][\w-]*)\s*>", re.IGNORECASE)
+# Split <parameter ...>...</parameter> delimiters: the parameter scan inside an
+# invoke body is forward-only too, so a closed invoke stuffed with unclosed
+# parameter openers can't drive finditer's O(n^2) rescan. See _iter_named_blocks.
+_XML_PARAM_OPEN_RE = re.compile(r'<parameter\s+name=["\'](\w+)["\']>', re.IGNORECASE)
+_XML_PARAM_CLOSE_RE = re.compile(r'</parameter>', re.IGNORECASE)
+# Closer tokens (any tag name) for the backref scanners, pre-indexed by name so a
+# flood of distinct unclosed tag names stays near-linear. See _iter_backref_blocks.
+_XML_DIRECT_CLOSE_ANY_RE = re.compile(r"</\s*([A-Za-z_][\w-]*)\s*>", re.IGNORECASE)
 # `args => { ... }` opener (its closer is the last `}`, found with rfind) and the
 # `<tag>` opener for tool_code XML params — both split out of greedy/backref
 # patterns that finditer would otherwise rescan from every opener. See
 # _parse_tool_call_block / _parse_tool_code_block.
 _ARGS_BRACE_OPEN_RE = re.compile(r'args\s*(?:=>|:|=)\s*\{')
 _TOOL_CODE_PARAM_OPEN_RE = re.compile(r"<(\w+)>")
+_TOOL_CODE_PARAM_CLOSE_ANY_RE = re.compile(r"</(\w+)>")
 
 # Pattern 3b: StepFun Step-3.x native tool-call tokens. The tokenizer defines:
 #   <｜tool▁calls▁begin｜> ... <｜tool▁calls▁end｜>
@@ -573,8 +583,8 @@ def _parse_xml_invoke(name, body) -> Optional[ToolBlock]:
     # raw capitalized name would be silently dropped.
     tool_name = name.lower()
     params = {}
-    for pm in _XML_PARAM_RE.finditer(body):
-        params[pm.group(1)] = pm.group(2).strip()
+    for pname, pval in _iter_named_blocks(body, _XML_PARAM_OPEN_RE, _XML_PARAM_CLOSE_RE):
+        params[pname] = pval.strip()
     # Local import to avoid a circular import at module load.
     from src.tool_schemas import function_call_to_tool_block
     return function_call_to_tool_block(tool_name, json.dumps(params))
@@ -735,7 +745,7 @@ def _parse_tool_code_block(raw: str) -> Optional[ToolBlock]:
     # backref scan so a `<x><x>...` opener flood can't drive the O(n^2) lazy
     # rescan (CodeQL py/polynomial-redos); see _iter_backref_blocks.
     xml_params = {}
-    for pname, pval in _iter_backref_blocks(args_body, _TOOL_CODE_PARAM_OPEN_RE, "</%s>"):
+    for pname, pval in _iter_backref_blocks(args_body, _TOOL_CODE_PARAM_OPEN_RE, _TOOL_CODE_PARAM_CLOSE_ANY_RE):
         xml_params[pname] = pval.strip()
 
     # When the model gave structured params, hand them to the canonical
@@ -817,62 +827,67 @@ def _strip_delimited(text: str, open_re, close_re) -> str:
     return "".join(out)
 
 
-def _iter_xml_invoke(text):
-    """Forward-only equivalent of ``_XML_INVOKE_RE.finditer``: yield
-    ``(name, body)`` for each ``<invoke name="..">...</invoke>``, pairing each
-    opener with the first ``</invoke>`` after it. O(n) — once no closer is
-    reachable from an opener, no later opener has one either (see _iter_delimited),
-    so untrusted invoke-opener floods can't drive the lazy O(n^2) rescan."""
+def _iter_named_blocks(text, open_re, close_re):
+    """Forward-only equivalent of ``open_re([\\s\\S]*?)close_re`` finditer where
+    open_re captures a name in group 1: yield ``(name, body)``, pairing each
+    opener with the first ``close_re`` after it. O(n) once no closer is reachable
+    from an opener, no later opener has one either (see _iter_delimited), so
+    untrusted opener floods can't drive the lazy O(n^2) rescan."""
     pos = 0
     while True:
-        om = _XML_INVOKE_OPEN_RE.search(text, pos)
+        om = open_re.search(text, pos)
         if om is None:
             return
-        cm = _XML_INVOKE_CLOSE_RE.search(text, om.end())
+        cm = close_re.search(text, om.end())
         if cm is None:
             return
         yield om.group(1), text[om.end():cm.start()]
         pos = cm.end()
 
 
-def _iter_backref_blocks(text, open_re, close_template, flags=0):
+def _iter_xml_invoke(text):
+    """Forward-only ``<invoke name="..">...</invoke>`` scan (see _iter_named_blocks)."""
+    return _iter_named_blocks(text, _XML_INVOKE_OPEN_RE, _XML_INVOKE_CLOSE_RE)
+
+
+def _iter_backref_blocks(text, open_re, close_any_re, ci=False):
     """Forward-only equivalent of an ``<tag>([\\s\\S]*?)</tag>`` backreference
     finditer (same-name open/close): yield ``(name, body)``, pairing each opener
     with the nearest following matching closer and skipping an opener whose
-    closer is unreachable. Tag names with no remaining closer are memoized, so a
-    repeated-opener flood stays O(n) instead of the lazy backref's O(n^2) rescan
-    (CodeQL py/polynomial-redos). ``close_template`` is a ``%s`` format whose slot
-    receives the re-escaped tag name (e.g. ``"</%s>"``)."""
-    pos = 0
-    exhausted = set()
-    close_cache = {}
-    ci = bool(flags & re.IGNORECASE)
-    while True:
-        om = open_re.search(text, pos)
-        if om is None:
-            return
+    closer is unreachable.
+
+    Every closer is indexed by tag name in one linear pass, then each opener
+    binary-searches its own name's closer positions. A flood of distinct unclosed
+    tag names therefore stays O(n log n) rather than the lazy backref's O(n^2)
+    suffix rescan (CodeQL py/polynomial-redos); per-name memoization alone left
+    that distinct-name case quadratic. ``close_any_re`` matches ANY closer and
+    captures its tag name in group 1; ``ci`` lowercases names for matching, since
+    the original backref closer is case-insensitive under re.IGNORECASE."""
+    norm = (lambda s: s.lower()) if ci else (lambda s: s)
+    closer_starts = {}
+    closer_ends = {}
+    for cm in close_any_re.finditer(text):
+        k = norm(cm.group(1))
+        closer_starts.setdefault(k, []).append(cm.start())
+        closer_ends.setdefault(k, []).append(cm.end())
+    om = open_re.search(text)
+    while om is not None:
         name = om.group(1)
-        key = name.lower() if ci else name
-        if key in exhausted:
-            pos = om.end()
-            continue
-        close_re = close_cache.get(key)
-        if close_re is None:
-            close_re = re.compile(close_template % re.escape(name), flags)
-            close_cache[key] = close_re
-        cm = close_re.search(text, om.end())
-        if cm is None:
-            exhausted.add(key)
-            pos = om.end()
-            continue
-        yield name, text[om.end():cm.start()]
-        pos = cm.end()
+        k = norm(name)
+        resume = om.end()
+        starts = closer_starts.get(k)
+        if starts:
+            i = bisect.bisect_left(starts, om.end())
+            if i < len(starts):
+                yield name, text[om.end():starts[i]]
+                resume = closer_ends[k][i]
+        om = open_re.search(text, resume)
 
 
 def _iter_xml_direct(text):
     """Forward-only equivalent of ``_XML_DIRECT_TOOL_RE.finditer`` (see
     _iter_backref_blocks)."""
-    return _iter_backref_blocks(text, _XML_DIRECT_OPEN_RE, r"</\s*%s\s*>", re.IGNORECASE)
+    return _iter_backref_blocks(text, _XML_DIRECT_OPEN_RE, _XML_DIRECT_CLOSE_ANY_RE, ci=True)
 
 
 def parse_tool_blocks(text: str, skip_fenced: bool = False) -> List[ToolBlock]:

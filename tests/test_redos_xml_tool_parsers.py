@@ -68,6 +68,33 @@ def test_tool_code_xml_params_still_parsed():
     assert [(b.tool_type, b.content) for b in blocks] == [("bash", "ls -la")]
 
 
+def test_xml_invoke_multiple_parameters_still_parsed():
+    # The invoke parameter scan is forward-only; a well-formed invoke with more
+    # than one <parameter> must still yield every name/value pair.
+    blocks = parse_tool_blocks(
+        '<tool_call><invoke name="web_search">'
+        '<parameter name="query">rust traits</parameter>'
+        '<parameter name="time_filter">week</parameter>'
+        '</invoke></tool_call>'
+    )
+    assert len(blocks) == 1
+    assert blocks[0].tool_type == "web_search"
+    assert '"query": "rust traits"' in blocks[0].content
+    assert '"time_filter": "week"' in blocks[0].content
+
+
+def test_xml_direct_distinct_tag_names_still_parsed():
+    # Distinct sibling tags inside <tool_call> each pair with their own closer;
+    # the forward-only direct scan must keep matching after the first block.
+    blocks = parse_tool_blocks(
+        '<tool_call><web_search>weather</web_search><read_file>notes.txt</read_file></tool_call>'
+    )
+    assert [(b.tool_type, b.content) for b in blocks] == [
+        ("web_search", "weather"),
+        ("read_file", "notes.txt"),
+    ]
+
+
 def test_tool_call_args_brace_still_parsed():
     blocks = parse_tool_blocks('[TOOL_CALL]{tool => "shell", args => {--command "ls"}}[/TOOL_CALL]')
     assert [(b.tool_type, b.content) for b in blocks] == [("bash", "ls")]
@@ -137,3 +164,34 @@ def test_tool_code_param_backref_flood_is_fast():
     # Through the public path, inside a closed <tool_code> block.
     _, dt2 = _timed(parse_tool_blocks, "<tool_code>{" + args_flood + "}</tool_code>")
     assert dt2 < _BUDGET_S, f"parse_tool_blocks took {dt2:.2f}s"
+
+
+def test_xml_invoke_closed_with_parameter_opener_flood_is_fast():
+    # A CLOSED <invoke> whose body is a flood of `<parameter name=..>` openers
+    # with no `</parameter>` closer: the invoke delimiter pairs fine, but the
+    # inner parameter scan must not rescan the body from every opener (O(n^2)).
+    evil = ('<tool_call><invoke name="bash">'
+            + '<parameter name="x">' * 6000
+            + '</invoke></tool_call>')
+    blocks, dt = _timed(parse_tool_blocks, evil)
+    assert dt < _BUDGET_S, f"parse_tool_blocks took {dt:.2f}s"
+    # No `</parameter>` ever closes, so no params are captured.
+    assert len(blocks) == 1 and blocks[0].tool_type == "bash"
+
+
+def test_xml_direct_distinct_name_opener_flood_is_fast():
+    # Distinct unclosed tag names (`<t0><t1>...`) defeat per-name memoization;
+    # the scan must still stay near-linear instead of searching the suffix once
+    # per new name.
+    evil = "<tool_call>" + "".join(f"<t{i}>" for i in range(45000))
+    blocks, dt = _timed(parse_tool_blocks, evil)
+    assert dt < _BUDGET_S, f"parse_tool_blocks took {dt:.2f}s"
+    assert blocks == []
+
+
+def test_tool_code_param_distinct_name_flood_is_fast():
+    # Same distinct-name flood inside tool_code args, reaching the param backref
+    # scan in _parse_tool_code_block.
+    args_flood = "tool => 'bash', args => " + "".join(f"<t{i}>" for i in range(45000))
+    _, dt = _timed(_parse_tool_code_block, args_flood)
+    assert dt < _BUDGET_S, f"_parse_tool_code_block took {dt:.2f}s"
