@@ -3,20 +3,12 @@ name: stale
 on:
   schedule:
     - cron: "0 3 * * *"
-    - cron: "0 6 * * *"
   workflow_dispatch:
     inputs:
       dry_run:
         description: "Report what would happen without changing anything"
         type: boolean
         default: true
-      tier:
-        description: "Select which inactivity tier to process"
-        type: choice
-        options:
-          - tier-1
-          - tier-2
-        default: tier-1
 
 # Default-deny at the workflow level; the job opts into only what it needs.
 permissions: {}
@@ -28,82 +20,43 @@ concurrency:
 jobs:
   stale:
     name: Mark and close inactive issues and PRs
+    # Scheduled runs stay dry until STALE_AUTOMATION_MODE=live; "off" pauses the
+    # schedule. Manual dispatches ignore the variable.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      vars.STALE_AUTOMATION_MODE != 'off'
     runs-on: ubuntu-latest
     permissions:
       issues: write  # label, comment on, and close inactive issues
       pull-requests: write  # same for PRs; labelling a PR still needs this scope
-      actions: write  # actions/stale rewrites its cursor entry in the Actions cache (see the note on operations-per-run below)
+      actions: write  # actions/stale stores its progress cursor in the Actions cache
     steps:
-      # Tier 1: PRs the description gate already flagged. check-pr-description.js
-      # applies and clears `needs work` automatically, so a PR still carrying it
-      # after 14 days means the author was told what to fix and did not.
-      #
-      # Budgets are load-bearing, do not lower them. actions/stale shares one
-      # hardcoded cache key ('_state') and records every item it examines, so a
-      # step that exhausts its budget leaves a cursor that makes the next
-      # invocation skip those items; a completed pass clears it. Dry runs need a
-      # far larger cap than live: operations count even when debug-only
-      # suppresses the API call, and a preview labels nothing so it re-walks the
-      # whole backlog each time. Nothing is written, so the cap costs only reads.
-      - name: Tier 1 - PRs flagged by the description gate
-        id: tier_1
+      - name: Guard manual live run
+        # Fail loudly on an un-ticked dry_run before the repo has opted in,
+        # rather than silently downgrading it to a dry run.
         if: >-
-          (github.event_name == 'schedule' &&
-           github.event.schedule == '0 3 * * *') ||
-          (github.event_name == 'workflow_dispatch' &&
-           inputs.tier == 'tier-1')
+          github.event_name == 'workflow_dispatch' &&
+          inputs.dry_run == false
+        env:
+          STALE_MODE: ${{ vars.STALE_AUTOMATION_MODE }}
+        run: |
+          if [ "$STALE_MODE" != "live" ]; then
+            echo "::error::Set STALE_AUTOMATION_MODE=live before requesting a live run."
+            exit 1
+          fi
+
+      # PRs are selected only by these labels, which all mean the contributor
+      # owes a response (a description fix, or a rebase). Clean review-ready PRs
+      # carry none of them, so review latency on our side cannot close a PR.
+      # Issues have no such signal, so they are selected by age.
+      - name: Mark and close inactive items
+        id: stale
         uses: actions/stale@1e223db275d687790206a7acac4d1a11bd6fe629  # v10.4.0
         with:
-          only-pr-labels: needs work
+          any-of-pr-labels: needs work, merge conflict, stale pr
           exempt-pr-labels: blocked, help wanted, good first issue, security, pinned
-          days-before-pr-stale: 14
-          days-before-pr-close: 14
-          # This step must never touch issues. -1 on close is load-bearing:
-          # without it this step would apply its own 14d close timer to issues
-          # that tier 2 had already labelled inactive.
-          days-before-issue-stale: -1
-          days-before-issue-close: -1
-          stale-pr-label: inactive
-          ascending: true
-          operations-per-run: ${{ inputs.dry_run && 10000 || 400 }}
-          debug-only: ${{ inputs.dry_run || false }}
-          stale-pr-message: |
-            This PR is labelled `needs work`, which the PR checks add
-            automatically when the description is missing a required section of
-            the pull request template. There has been no activity for 14 days.
-
-            To keep it open, fill in the missing sections and push or comment.
-            The checks re-run on every push and swap the label back to
-            `ready for review`, which clears this automatically.
-
-            Otherwise it closes in 14 days. To be clear, that is about the
-            description, not the code. Nothing is deleted, your branch is
-            untouched, and you can reopen at any time.
-          close-pr-message: |
-            Closing after 14 days with no update, with `needs work` still set,
-            meaning the description was missing required sections of the
-            template.
-
-            This is not a rejection of the change itself. If you want to pick it
-            back up, complete the description and reopen this PR, or open a
-            fresh one. Your branch is untouched.
-
-      # Tier 2: everything else. Exempting `needs work` keeps this from
-      # double-processing the PRs above. Separate hourly API window from tier 1,
-      # and it carries the issue backlog, so it gets the larger budget and is the
-      # first to truncate without one. Same budget rules as tier 1.
-      - name: Tier 2 - general inactivity
-        id: tier_2
-        if: >-
-          (github.event_name == 'schedule' &&
-           github.event.schedule == '0 6 * * *') ||
-          (github.event_name == 'workflow_dispatch' &&
-           inputs.tier == 'tier-2')
-        uses: actions/stale@1e223db275d687790206a7acac4d1a11bd6fe629  # v10.4.0
-        with:
-          exempt-pr-labels: needs work, blocked, help wanted, good first issue, security, pinned
           exempt-issue-labels: blocked, help wanted, good first issue, security, pinned
-          days-before-pr-stale: 60
+          days-before-pr-stale: 14
           days-before-pr-close: 14
           days-before-issue-stale: 45
           days-before-issue-close: 14
@@ -111,28 +64,30 @@ jobs:
           stale-issue-label: inactive
           close-issue-reason: not_planned
           ascending: true
-          operations-per-run: ${{ inputs.dry_run && 10000 || 600 }}
-          debug-only: ${{ inputs.dry_run || false }}
+          # A newly stale item costs 4 counted ops including 2 real reads that
+          # run even in a dry run, so do not raise this: 800 keeps both modes
+          # under the GITHUB_TOKEN 1000/hr limit. The backlog drains over a few
+          # daily runs via the Actions-cache cursor.
+          operations-per-run: 800
+          debug-only: ${{ inputs.dry_run || vars.STALE_AUTOMATION_MODE != 'live' }}
           stale-pr-message: |
-            No activity on this PR for 60 days, so it is now labelled
-            `inactive`.
+            No response for 14 days on a PR flagged as needing action from you
+            (`needs work` for a description fix, or `merge conflict` / `stale pr`
+            for a rebase), so it is now labelled `inactive`.
 
-            Comment or push to keep it open. Either one clears the label and
-            resets the clock.
+            Push or comment to keep it open. Either one clears the label and
+            resets the clock; fixing the flagged item is what the labels are
+            waiting on.
 
-            If you are waiting on a maintainer review rather than on yourself,
-            say so in a comment and it stays open. That is a normal reason for a
-            PR to sit here and it should not count against you.
-
-            Otherwise it closes in 14 days. That is queue management, not a
-            verdict on the change.
+            Otherwise it closes in 14 days. Nothing is deleted, your branch is
+            untouched, and you can reopen at any time.
           close-pr-message: |
-            Closing after 74 days with no activity: 60 days idle, plus the 14 day
-            notice once `inactive` was applied.
+            Closing after 28 days with no response on a PR that was waiting on a
+            change from you: 14 days after the `inactive` label, which itself
+            followed 14 quiet days on a flagged PR.
 
-            This is queue maintenance, not a review decision. Nothing is lost.
-            Your branch still exists on your fork and you can reopen this PR or
-            open a new one at any time.
+            This is not a verdict on the change. Push the fix and reopen this PR,
+            or open a fresh one, whenever you are ready. Your branch is untouched.
           stale-issue-message: |
             No activity on this issue for 45 days, so it is now labelled
             `inactive`.
@@ -152,28 +107,25 @@ jobs:
             Including your version or commit and the steps to reproduce will
             help.
 
-      # Every run, not just previews: live runs leave a record of what changed.
+      # Preview on a dry run, record of what changed on a live run.
       - name: Publish review queue
-        if: >-
-          always() &&
-          (steps.tier_1.outcome == 'success' ||
-           steps.tier_2.outcome == 'success')
+        if: always() && steps.stale.outcome == 'success'
         shell: bash
         env:
           DRY_RUN: ${{ inputs.dry_run || false }}
-          TIER_1_OUTCOME: ${{ steps.tier_1.outcome }}
-          TIER_2_OUTCOME: ${{ steps.tier_2.outcome }}
-          TIER_1_STALE: ${{ steps.tier_1.outputs['staled-issues-prs'] || '[]' }}
-          TIER_1_CLOSE: ${{ steps.tier_1.outputs['closed-issues-prs'] || '[]' }}
-          TIER_2_STALE: ${{ steps.tier_2.outputs['staled-issues-prs'] || '[]' }}
-          TIER_2_CLOSE: ${{ steps.tier_2.outputs['closed-issues-prs'] || '[]' }}
+          # These outputs serialise the action's full option set, repo token
+          # included. Never echo them raw; the jq below strips to safe fields.
+          RAW_STALE: ${{ steps.stale.outputs['staled-issues-prs'] || '[]' }}
+          RAW_CLOSE: ${{ steps.stale.outputs['closed-issues-prs'] || '[]' }}
         run: |
+          SAFE_STALE=$(jq -c 'map({number, title, created_at, pull_request})' <<< "$RAW_STALE")
+          SAFE_CLOSE=$(jq -c 'map({number, title, created_at, pull_request})' <<< "$RAW_CLOSE")
+
           render_items() {
             local heading="$1"
             local items="$2"
 
-            if ! jq -e 'type == "array" and length > 0' \
-              >/dev/null 2>&1 <<< "$items"; then
+            if ! jq -e 'length > 0' >/dev/null 2>&1 <<< "$items"; then
               echo "### $heading"
               echo "_None._"
               echo
@@ -183,15 +135,14 @@ jobs:
             echo "### $heading ($(jq -r 'length' <<< "$items"))"
             echo
 
-            # title and updated_at are already in the action's output, so
-            # showing them costs nothing and makes the queue reviewable
-            # without opening every link.
+            # created_at, not updated_at: the action rewrites updated_at to the
+            # run time when it marks an item, so it cannot show last activity.
             jq -r --arg repo "$GITHUB_REPOSITORY" '
               .[] |
               (if .pull_request then "pull" else "issues" end) as $path |
               (if .pull_request then "PR" else "Issue" end) as $kind |
               "- [\($kind) #\(.number)](https://github.com/\($repo)/\($path)/\(.number))" +
-              " last activity \(.updated_at[0:10]) - \(.title)"
+              " opened \(.created_at[0:10]) - \(.title)"
             ' <<< "$items"
             echo
           }
@@ -213,17 +164,9 @@ jobs:
             echo
             echo "$note"
             echo
-            echo "If an item should stay open, add an exempt label or adjust"
-            echo "the thresholds in .github/workflows/stale.yml."
+            echo "If an item should stay open, add an exempt label or adjust the"
+            echo "thresholds in .github/workflows/stale.yml."
             echo
-
-            if [ "$TIER_1_OUTCOME" = "success" ]; then
-              render_items "Tier 1: $marked" "$TIER_1_STALE"
-              render_items "Tier 1: $closed" "$TIER_1_CLOSE"
-            fi
-
-            if [ "$TIER_2_OUTCOME" = "success" ]; then
-              render_items "Tier 2: $marked" "$TIER_2_STALE"
-              render_items "Tier 2: $closed" "$TIER_2_CLOSE"
-            fi
+            render_items "$marked" "$SAFE_STALE"
+            render_items "$closed" "$SAFE_CLOSE"
           } >> "$GITHUB_STEP_SUMMARY"
